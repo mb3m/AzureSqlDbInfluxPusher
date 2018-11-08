@@ -19,8 +19,8 @@ namespace AzureSqlDbInfluxPusher
                 InfluxDbPassword = appSettings["InfluxDb.Password"],
                 InfluxDbDatabase = appSettings["InfluxDb.Database"],
 
-                InfluxDbMeasureResourceStats = appSettings["resource_stats"],
-                InfluxDbMeasureDatabaseResourceStats = appSettings["db_resource_stats"],
+                InfluxDbMeasureResourceStats = appSettings["InfluxDb.Measure.ResourceStats"],
+                InfluxDbMeasureDatabaseResourceStats = appSettings["InfluxDb.Measure.DatabaseResourceStats"],
 
                 SerilogFileName = appSettings["Serilog.FileName"],
                 SerilogSeqUri = appSettings["Serilog.Seq.Url"],
