@@ -31,6 +31,8 @@ namespace AzureSqlDbInfluxPusher
 
         private readonly Settings settings;
 
+        private static readonly Random random = new Random();
+
         private DateTime previousMasterCollectTime;
         private DateTime lastDbListUpdate;
         private bool console;
@@ -172,6 +174,7 @@ namespace AzureSqlDbInfluxPusher
 
                     var maxTime = DateTime.MinValue;
 
+
                     using (var reader = await cmd.ExecuteReaderAsync())
                     {
                         while (reader.Read())
@@ -181,8 +184,8 @@ namespace AzureSqlDbInfluxPusher
                             var r = new ResourceStatRow();
                             //var startTime = reader.GetDateTime(0);
                             r.Time = reader.GetDateTime(0); // start_time
-                            //r.Time = reader.GetDateTime(1);
-                            //var sku = reader.GetString(3);
+                                                            //r.Time = reader.GetDateTime(1);
+                                                            //var sku = reader.GetString(3);
                             r.Size = reader.GetDouble(4);
                             r.AvgCpuPercent = reader.GetDecimal(5);
                             r.AvgIOPercent = reader.GetDecimal(6);
@@ -313,63 +316,87 @@ namespace AzureSqlDbInfluxPusher
 
             var writer = new StringBuilder();
             var count = 0;
+            var success = false;
+            var retries = 0;
+            SqlException lastException = null;
 
-            using (var conn = OpenDb(dbName))
+            do
             {
-                using (var cmd = conn.CreateCommand())
+                try
                 {
-                    cmd.CommandText = @"select * from sys.dm_db_resource_stats";
-                    using (var reader = cmd.ExecuteReader())
+                    using (var conn = OpenDb(dbName))
                     {
-                        DateTime mostRecentTime = DateTime.MinValue;
-
-                        while (reader.Read())
+                        using (var cmd = conn.CreateCommand())
                         {
-                            // end_time
-                            var time = reader.GetDateTime(0);
-
-                            if (time <= lastUpdate)
+                            cmd.CommandText = @"select * from sys.dm_db_resource_stats";
+                            using (var reader = cmd.ExecuteReader())
                             {
-                                // stats list is in descending order
-                                // as soon as we found a row older that the last stat, then we can consider we read all the new rows, and that we can stop reading results
-                                break;
+                                DateTime mostRecentTime = DateTime.MinValue;
+
+                                while (reader.Read())
+                                {
+                                    // end_time
+                                    var time = reader.GetDateTime(0);
+
+                                    if (time <= lastUpdate)
+                                    {
+                                        // stats list is in descending order
+                                        // as soon as we found a row older that the last stat, then we can consider we read all the new rows, and that we can stop reading results
+                                        break;
+                                    }
+
+                                    var cpu = reader.GetDecimal(1);         // Average compute utilization in percentage of the limit of the service tier.
+                                    var io = reader.GetDecimal(2);          // Average data I/O utilization in percentage of the limit of the service tier.
+                                    var log = reader.GetDecimal(3);         // Average write resource utilization in percentage of the limit of the service tier.
+                                    var mem = reader.GetDecimal(4);         // Average memory utilization in percentage of the limit of the service tier. This includes memory used for storage of In - Memory OLTP objects.
+                                    var xtp = reader.GetDecimal(5);         // Storage utilization for In-Memory OLTP in percentage of the limit of the service tier (at the end of the reporting interval).
+                                                                            // This includes memory used for storage of the following In-Memory OLTP objects: memory-optimized tables, indexes, and table variables. It also includes memory used for processing ALTER TABLE operations.                                        
+                                                                            // Returns 0 if In - Memory OLTP is not used in the database.
+                                    var worker = reader.GetDecimal(6);      // Maximum concurrent workers (requests) in percentage of the limit of the database’s service tier.
+                                    var session = reader.GetDecimal(7);     // Maximum concurrent sessions in percentage of the limit of the database’s service tier.
+
+                                    if (time > mostRecentTime)
+                                    {
+                                        mostRecentTime = time;
+                                    }
+
+                                    writer.AppendFormat(
+                                        CultureInfo.InvariantCulture,
+                                        "{0},db={1} avg_cpu={2},avg_io={3},avg_log={4},avg_mem={5},avg_xtp={6},max_worker={7},max_session={8} {9}\n",
+                                        "db_resource_stats",
+                                        dbName,
+                                        cpu,
+                                        io,
+                                        log,
+                                        mem,
+                                        xtp,
+                                        worker,
+                                        session,
+                                        DateTimeToSecondsUnixTimestamp(time)
+                                    );
+                                    count++;
+                                }
+
+                                lastDbUpdate[dbName] = mostRecentTime;
                             }
-
-                            var cpu = reader.GetDecimal(1);         // Average compute utilization in percentage of the limit of the service tier.
-                            var io = reader.GetDecimal(2);          // Average data I/O utilization in percentage of the limit of the service tier.
-                            var log = reader.GetDecimal(3);         // Average write resource utilization in percentage of the limit of the service tier.
-                            var mem = reader.GetDecimal(4);         // Average memory utilization in percentage of the limit of the service tier. This includes memory used for storage of In - Memory OLTP objects.
-                            var xtp = reader.GetDecimal(5);         // Storage utilization for In-Memory OLTP in percentage of the limit of the service tier (at the end of the reporting interval).
-                                                                    // This includes memory used for storage of the following In-Memory OLTP objects: memory-optimized tables, indexes, and table variables. It also includes memory used for processing ALTER TABLE operations.                                        
-                                                                    // Returns 0 if In - Memory OLTP is not used in the database.
-                            var worker = reader.GetDecimal(6);      // Maximum concurrent workers (requests) in percentage of the limit of the database’s service tier.
-                            var session = reader.GetDecimal(7);     // Maximum concurrent sessions in percentage of the limit of the database’s service tier.
-
-                            if (time > mostRecentTime)
-                            {
-                                mostRecentTime = time;
-                            }
-
-                            writer.AppendFormat(
-                                CultureInfo.InvariantCulture,
-                                "{0},db={1} avg_cpu={2},avg_io={3},avg_log={4},avg_mem={5},avg_xtp={6},max_worker={7},max_session={8} {9}\n",
-                                "db_resource_stats",
-                                dbName,
-                                cpu,
-                                io,
-                                log,
-                                mem,
-                                xtp,
-                                worker,
-                                session,
-                                DateTimeToSecondsUnixTimestamp(time)
-                            );
-                            count++;
                         }
-
-                        lastDbUpdate[dbName] = mostRecentTime;
                     }
+
+                    success = true;
                 }
+                catch (SqlException sqlEx)
+                {
+                    // attente entre .1 et 1 secondes
+                    Thread.Sleep(random.Next(1, 10) * 100);
+                    lastException = sqlEx;
+                    retries++;
+                }
+            } while (!success && retries < 4);
+
+            if (!success && lastException != null)
+            {
+                this.log.Error(lastException, "Erreur durant la collecte des métriques pour la base de données {DatabaseName} après 3 tentatives", dbName);
+                return;
             }
 
             batch.Append(writer, count, dbName);
